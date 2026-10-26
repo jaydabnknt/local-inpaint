@@ -1,0 +1,106 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QNN_VERSION: 2.51.0.260929
+  NDK_VERSION: r28c
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK ${{ env.NDK_VERSION }}
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      # CMakePresets.json pins ANDROID_NDK_ROOT to /data/android-ndk-r28
+      - name: Link NDK where the CMake preset expects it
+        run: |
+          sudo mkdir -p /data
+          sudo ln -sfn "${{ steps.ndk.outputs.ndk-path }}" /data/android-ndk-r28
+          ls /data/android-ndk-r28/build/cmake/android.toolchain.cmake
+
+      - name: Rust toolchain (for tokenizers)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-linux-android
+
+      - name: Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Cache Qualcomm AI Runtime SDK
+        id: qnn-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/qairt
+          key: qairt-${{ env.QNN_VERSION }}
+
+      - name: Download Qualcomm AI Runtime SDK
+        if: steps.qnn-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/qairt && cd ~/qairt
+          curl -fL --retry 3 -o qairt.zip \
+            "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QNN_VERSION}/v${QNN_VERSION}.zip"
+          unzip -q qairt.zip && rm qairt.zip
+
+      - name: Locate SDK root
+        run: |
+          root=$(dirname "$(find ~/qairt -type d -path '*/include/QNN' | head -1)")
+          root=$(dirname "$root")
+          echo "QNN_SDK_ROOT=$root" >> "$GITHUB_ENV"
+          echo "SDK at $root"; ls "$root"
+
+      - name: Build native engine
+        working-directory: app/src/main/cpp
+        run: bash build.sh
+
+      - name: Build APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleBasicRelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalInpaint-apk
+          path: app/build/outputs/apk/basic/release/*.apk
+
+      - name: Publish as latest release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          prerelease: false
+          make_latest: true
+          body: "Built from ${{ github.sha }}. Download the APK below."
+          files: app/build/outputs/apk/basic/release/*.apk
+    permissions:
+      contents: write
