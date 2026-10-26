@@ -88,9 +88,19 @@ jobs:
           echo "QNN_SDK_ROOT=$root" >> "$GITHUB_ENV"
           echo "SDK at $root"; ls "$root"
 
+      # Newer Rust turns dangerous_implicit_autorefs into a hard error in tokenizers-cpp.
+      # Make those autorefs explicit (same behaviour) and also allow the lint.
+      - name: Patch tokenizers-cpp for current Rust
+        run: |
+          f=app/src/main/cpp/3rdparty/tokenizers-cpp/rust/src/lib.rs
+          sed -i -E 's/\(\*handle\)\.([A-Za-z_]+)\.len\(\)/(\&(*handle).\1).len()/g' "$f"
+          grep -n 'len()' "$f" | head
+
       - name: Build native engine
         id: native
         working-directory: app/src/main/cpp
+        env:
+          CARGO_ENCODED_RUSTFLAGS: -Adangerous_implicit_autorefs
         run: ../../../../ci/run.sh "Native build" bash build.sh
 
       - name: Build APK
