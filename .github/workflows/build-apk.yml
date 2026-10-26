@@ -15,46 +15,50 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: write
     steps:
-      - name: Free disk space
+      - uses: actions/checkout@v5
+
+      - name: Submodules
+        id: submodules
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost
-          df -h /
+          chmod +x ci/run.sh
+          # The DiT engine (stable-diffusion.cpp) isn't built, so skip its heavy nested submodules.
+          ci/run.sh "Submodules" bash -c '
+            git submodule sync &&
+            git submodule update --init --depth 1 --jobs 4 &&
+            git -C app/src/main/cpp/3rdparty/tokenizers-cpp submodule update --init --depth 1'
 
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
+        id: java
         with:
           distribution: temurin
           java-version: 21
 
-      - uses: android-actions/setup-android@v3
-
-      - name: Install NDK ${{ env.NDK_VERSION }}
-        id: ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: ${{ env.NDK_VERSION }}
-          add-to-path: false
-
-      # CMakePresets.json pins ANDROID_NDK_ROOT to /data/android-ndk-r28
-      - name: Link NDK where the CMake preset expects it
+      - name: Android SDK / NDK / tools
+        id: toolchain
         run: |
-          sudo mkdir -p /data
-          sudo ln -sfn "${{ steps.ndk.outputs.ndk-path }}" /data/android-ndk-r28
-          ls /data/android-ndk-r28/build/cmake/android.toolchain.cmake
-
-      - name: Rust toolchain (for tokenizers)
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add aarch64-linux-android
-
-      - name: Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+          ci/run.sh "Toolchain" bash -c '
+            set -e
+            sdk="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+            echo "SDK: $sdk"
+            ndk_dir="$HOME/android-ndk-${NDK_VERSION}"
+            curl -fsSL --retry 3 -o /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+            unzip -q /tmp/ndk.zip -d "$HOME" && rm /tmp/ndk.zip
+            sudo mkdir -p /data
+            sudo ln -sfn "$ndk_dir" /data/android-ndk-r28
+            test -f /data/android-ndk-r28/build/cmake/android.toolchain.cmake
+            sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
+            rustup toolchain install stable --profile minimal
+            rustup default stable
+            rustup target add aarch64-linux-android
+            cmake --version'
 
       - name: Cache Qualcomm AI Runtime SDK
         id: qnn-cache
@@ -64,28 +68,36 @@ jobs:
           key: qairt-${{ env.QNN_VERSION }}
 
       - name: Download Qualcomm AI Runtime SDK
+        id: qnn
         if: steps.qnn-cache.outputs.cache-hit != 'true'
         run: |
-          mkdir -p ~/qairt && cd ~/qairt
-          curl -fL --retry 3 -o qairt.zip \
-            "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QNN_VERSION}/v${QNN_VERSION}.zip"
-          unzip -q qairt.zip && rm qairt.zip
+          ci/run.sh "QNN SDK download" bash -c '
+            set -e
+            mkdir -p ~/qairt && cd ~/qairt
+            curl -fL --retry 3 -o qairt.zip \
+              "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QNN_VERSION}/v${QNN_VERSION}.zip"
+            unzip -q qairt.zip && rm qairt.zip
+            ls ~/qairt'
 
       - name: Locate SDK root
+        id: qnnroot
         run: |
-          root=$(dirname "$(find ~/qairt -type d -path '*/include/QNN' | head -1)")
-          root=$(dirname "$root")
+          inc=$(find ~/qairt -type d -path '*/include/QNN' | head -1)
+          if [ -z "$inc" ]; then echo "::error title=QNN SDK::include/QNN not found in $(ls -R ~/qairt | head -20 | tr '\n' ' ')"; exit 1; fi
+          root=$(dirname "$(dirname "$inc")")
           echo "QNN_SDK_ROOT=$root" >> "$GITHUB_ENV"
           echo "SDK at $root"; ls "$root"
 
       - name: Build native engine
+        id: native
         working-directory: app/src/main/cpp
-        run: bash build.sh
+        run: ../../../../ci/run.sh "Native build" bash build.sh
 
       - name: Build APK
+        id: apk
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon assembleBasicRelease
+          ci/run.sh "Gradle build" ./gradlew --no-daemon --stacktrace assembleBasicRelease
 
       - uses: actions/upload-artifact@v4
         with:
@@ -93,14 +105,15 @@ jobs:
           path: app/build/outputs/apk/basic/release/*.apk
 
       - name: Publish as latest release
-        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: Latest build
-          prerelease: false
           make_latest: true
           body: "Built from ${{ github.sha }}. Download the APK below."
           files: app/build/outputs/apk/basic/release/*.apk
-    permissions:
-      contents: write
+
+      - name: Report failed step
+        if: failure()
+        run: |
+          echo "::error title=Step outcomes::submodules=${{ steps.submodules.outcome }} java=${{ steps.java.outcome }} toolchain=${{ steps.toolchain.outcome }} qnn=${{ steps.qnn.outcome }} qnnroot=${{ steps.qnnroot.outcome }} native=${{ steps.native.outcome }} apk=${{ steps.apk.outcome }}"
